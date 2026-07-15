@@ -95,7 +95,7 @@ import {
   setCurrentCwd
 } from '@/store/session'
 
-import { type AppView, ARTIFACTS_ROUTE, MESSAGING_ROUTE, SKILLS_ROUTE } from '../../routes'
+import { type AppView, ARTIFACTS_ROUTE, SKILLS_ROUTE } from '../../routes' // [yep-fork] MESSAGING_ROUTE убран вместе со скрытой вкладкой Messaging
 import type { SidebarNavItem } from '../../types'
 
 import { countLabel } from './chrome'
@@ -143,7 +143,9 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
     icon: props => <Codicon name="symbol-misc" {...props} />,
     route: SKILLS_ROUTE
   },
-  { id: 'messaging', label: '', icon: props => <Codicon name="comment" {...props} />, route: MESSAGING_ROUTE },
+  // [yep-fork] Скрыта вкладка Messaging из левого рейла для минимального профиля.
+  // Роут /messaging и логика не удалены — убрана только навигационная кнопка.
+  // { id: 'messaging', label: '', icon: props => <Codicon name="comment" {...props} />, route: MESSAGING_ROUTE },
   { id: 'artifacts', label: '', icon: props => <Codicon name="files" {...props} />, route: ARTIFACTS_ROUTE }
 ]
 
