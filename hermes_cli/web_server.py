@@ -12410,6 +12410,7 @@ _SKILL_HUB_SOURCE_LABELS = {
     "claude-marketplace": "Claude Marketplace",
     "lobehub": "LobeHub",
     "browse-sh": "browse.sh",
+    "marketplace": "Marketplace",  # [yep-fork] git-маркетплейсы (skills.hub.marketplaces)
 }
 
 

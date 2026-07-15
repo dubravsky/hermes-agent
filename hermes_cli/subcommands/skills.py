@@ -32,6 +32,7 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
         default="all",
         choices=[
             "all",
+            "marketplace",  # [yep-fork] git-маркетплейсы
             "official",
             "skills-sh",
             "well-known",
@@ -60,6 +61,7 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
         default="all",
         choices=[
             "all",
+            "marketplace",  # [yep-fork] git-маркетплейсы
             "official",
             "skills-sh",
             "well-known",

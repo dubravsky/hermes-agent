@@ -2390,6 +2390,22 @@ DEFAULT_CONFIG = {
         #                     never crammed into a chat bubble), apply with
         #                     /skills approve <id> or drop with /skills reject <id>.
         "write_approval": False,
+        # [yep-fork] Хаб скилов: какие источники показывать и наши маркетплейсы.
+        "hub": {
+            # Белый список source_id, видимых в UI/CLI/поиске хаба. По
+            # умолчанию — только наш git-маркетплейс ("marketplace"); публичные
+            # хабы скрыты из интерфейса, но включаются обратно добавлением их
+            # id, например:
+            #   ["marketplace","official","github","claude-marketplace",
+            #    "skills-sh","clawhub","lobehub","browse-sh","well-known","url"]
+            "enabled_sources": ["marketplace"],
+            # claude-plugin маркетплейсы на ЛЮБОМ git-хосте (в т.ч. не GitHub).
+            # Каждый — git-URL репозитория с .claude-plugin/marketplace.json,
+            # читается источником "marketplace" (GitMarketplaceSource).
+            "marketplaces": [
+                "https://git.sourcecraft.dev/edoubrav/claude-plugins.git",
+            ],
+        },
     },
 
     # Curator — background skill maintenance.

@@ -4052,18 +4052,259 @@ class HermesIndexSource(SkillSource):
         )
 
 
+# ---------------------------------------------------------------------------
+# [yep-fork] Git marketplace source — claude-plugin marketplaces on ANY git host
+# ---------------------------------------------------------------------------
+
+# Дефолты форка. По умолчанию в интерфейсе виден только наш git-маркетплейс;
+# публичные хабы скрыты, но включаются через config.yaml (skills.hub.*).
+_DEFAULT_MARKETPLACE_URLS = [
+    "https://git.sourcecraft.dev/edoubrav/claude-plugins.git",
+]
+_DEFAULT_ENABLED_SOURCES = ["marketplace"]
+
+
+class GitMarketplaceSource(SkillSource):
+    """claude-plugin marketplace(s) hosted on ANY git server (incl. non-GitHub).
+
+    Unlike ClaudeMarketplaceSource (GitHub Contents API only), this clones each
+    configured marketplace repo over plain git (shallow, cached under the hub
+    dir), reads ``.claude-plugin/marketplace.json``, enumerates every
+    ``<plugin>/skills/*/SKILL.md`` and exposes each SKILL.md as an installable
+    skill. Repos on git.sourcecraft.dev / self-hosted GitLab / etc. work.
+
+    Limitation: only the skill directory + its safe support subdirs
+    (references/templates/scripts/assets/examples) are bundled on install —
+    claude-plugin cross-plugin ``@../shared`` includes and hooks are NOT ported
+    (format gap between claude-plugin and hermes-skill).
+    """
+
+    SOURCE_ID = "marketplace"
+    _ID_SEP = "::"
+
+    def __init__(self, marketplace_urls: Optional[List[str]] = None):
+        self.urls = [u for u in (marketplace_urls or []) if u]
+        self._refreshed: set = set()  # per-process: repos already pulled this run
+
+    def source_id(self) -> str:
+        return self.SOURCE_ID
+
+    def trust_level_for(self, identifier: str) -> str:
+        # Собственный маркетплейс организации считаем доверенным.
+        return "trusted"
+
+    @staticmethod
+    def _slug(url: str) -> str:
+        base = url.split("://", 1)[-1]
+        return re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("_") or "marketplace"
+
+    def _clone_dir(self, url: str) -> Path:
+        return _hub_dir() / "marketplaces" / self._slug(url)
+
+    def _ensure_clone(self, url: str) -> Optional[Path]:
+        """Clone (shallow) or refresh once-per-process. Best-effort: on git
+        failure fall back to an existing clone, else return None."""
+        dest = self._clone_dir(url)
+        git = shutil.which("git") or "git"
+        try:
+            if (dest / ".git").exists():
+                if url not in self._refreshed:
+                    self._refreshed.add(url)
+                    subprocess.run(
+                        [git, "-C", str(dest), "pull", "--ff-only", "--quiet"],
+                        capture_output=True, text=True, timeout=60,
+                        creationflags=windows_hide_flags(),
+                    )
+                return dest
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            self._refreshed.add(url)
+            res = subprocess.run(
+                [git, "clone", "--depth", "1", url, str(dest)],
+                capture_output=True, text=True, timeout=120,
+                creationflags=windows_hide_flags(),
+            )
+            if res.returncode != 0:
+                logger.warning(
+                    "marketplace clone failed for %s: %s", url, res.stderr.strip()[:200]
+                )
+                return dest if (dest / ".git").exists() else None
+            return dest
+        except Exception as e:
+            logger.debug("marketplace clone/pull error for %s: %s", url, e)
+            return dest if (dest / ".git").exists() else None
+
+    def _iter_skill_dirs(self, clone: Path):
+        """Yield (skill_dir, rel_posix) for every SKILL.md in the marketplace.
+
+        Плагины берём из .claude-plugin/marketplace.json (локальные source
+        ``./name``); внутри плагина ищем skills/*/SKILL.md. Без manifest —
+        фолбэк-скан ``*/skills/*/SKILL.md``."""
+        mk_file = clone / ".claude-plugin" / "marketplace.json"
+        plugin_dirs: List[str] = []
+        if mk_file.exists():
+            try:
+                data = json.loads(mk_file.read_text(encoding="utf-8"))
+                for plugin in data.get("plugins", []):
+                    src = str(plugin.get("source", "")).strip()
+                    # Только самодостаточные локальные источники (./name | name)
+                    if src.startswith("./") or (src and "/" not in src.rstrip("/")):
+                        plugin_dirs.append(src.lstrip("./").rstrip("/"))
+            except (OSError, json.JSONDecodeError) as e:
+                logger.debug("bad marketplace.json in %s: %s", clone, e)
+        if not plugin_dirs:
+            for skill_md in sorted(clone.glob("*/skills/*/SKILL.md")):
+                yield skill_md.parent, skill_md.parent.relative_to(clone).as_posix()
+            return
+        for pdir in plugin_dirs:
+            skills_root = clone / pdir / "skills"
+            if not skills_root.is_dir():
+                continue
+            for skill_md in sorted(skills_root.glob("*/SKILL.md")):
+                yield skill_md.parent, skill_md.parent.relative_to(clone).as_posix()
+
+    def _meta_from_skill(self, url: str, skill_dir: Path, rel: str) -> Optional[SkillMeta]:
+        try:
+            content = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+        except OSError:
+            return None
+        from agent.skill_utils import parse_frontmatter
+        fm, _ = parse_frontmatter(content)
+        identifier = f"{url}{self._ID_SEP}{rel}"
+        return SkillMeta(
+            name=str(fm.get("name") or skill_dir.name),
+            description=str(fm.get("description") or ""),
+            source=self.SOURCE_ID,
+            identifier=identifier,
+            trust_level=self.trust_level_for(identifier),
+            repo=url,
+            path=rel,
+        )
+
+    def search(self, query: str, limit: int = 10) -> List[SkillMeta]:
+        q = (query or "").lower().strip()
+        results: List[SkillMeta] = []
+        for url in self.urls:
+            clone = self._ensure_clone(url)
+            if clone is None:
+                continue
+            for skill_dir, rel in self._iter_skill_dirs(clone):
+                meta = self._meta_from_skill(url, skill_dir, rel)
+                if meta is None:
+                    continue
+                if q and q not in f"{meta.name} {meta.description}".lower():
+                    continue
+                results.append(meta)
+                if len(results) >= limit:
+                    return results
+        return results
+
+    def _parse_identifier(self, identifier: str) -> Optional[tuple]:
+        if self._ID_SEP not in identifier:
+            return None
+        url, rel = identifier.split(self._ID_SEP, 1)
+        return url, rel
+
+    def _resolve_skill_dir(self, clone: Path, rel: str) -> Optional[Path]:
+        clone_root = clone.resolve()
+        skill_dir = (clone / rel).resolve()
+        try:
+            skill_dir.relative_to(clone_root)
+        except ValueError:
+            return None  # traversal outside the clone
+        return skill_dir if (skill_dir / "SKILL.md").exists() else None
+
+    def inspect(self, identifier: str) -> Optional[SkillMeta]:
+        parsed = self._parse_identifier(identifier)
+        if not parsed:
+            return None
+        url, rel = parsed
+        clone = self._ensure_clone(url)
+        if clone is None:
+            return None
+        skill_dir = self._resolve_skill_dir(clone, rel)
+        if skill_dir is None:
+            return None
+        return self._meta_from_skill(url, skill_dir, rel)
+
+    def fetch(self, identifier: str) -> Optional[SkillBundle]:
+        parsed = self._parse_identifier(identifier)
+        if not parsed:
+            return None
+        url, rel = parsed
+        clone = self._ensure_clone(url)
+        if clone is None:
+            return None
+        skill_dir = self._resolve_skill_dir(clone, rel)
+        if skill_dir is None:
+            return None
+        try:
+            skill_md = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+        except OSError:
+            return None
+        referenced = _referenced_support_paths(skill_md)
+        if referenced is None:
+            return None  # traversal attempt in support-file refs
+        files: Dict[str, Union[str, bytes]] = {"SKILL.md": skill_md}
+        skill_root = skill_dir.resolve()
+        for relp in sorted(referenced):
+            raw = skill_dir / relp
+            if raw.is_symlink():
+                logger.warning("rejected symlinked skill support file: %s", raw)
+                return None
+            fpath = raw.resolve()
+            try:
+                fpath.relative_to(skill_root)
+            except ValueError:
+                return None
+            if not fpath.is_file():
+                logger.warning("marketplace skill support file missing: %s", fpath)
+                return None
+            files[relp] = fpath.read_bytes()
+        from agent.skill_utils import parse_frontmatter
+        fm, _ = parse_frontmatter(skill_md)
+        return SkillBundle(
+            name=str(fm.get("name") or skill_dir.name),
+            files=files,
+            source=self.SOURCE_ID,
+            identifier=identifier,
+            trust_level=self.trust_level_for(identifier),
+            metadata={"marketplace_url": url, "path": rel},
+        )
+
+
 def create_source_router(auth: Optional[GitHubAuth] = None) -> List[SkillSource]:
     """
     Create all configured source adapters.
     Returns a list of active sources for search/fetch operations.
+
+    [yep-fork] Источники фильтруются белым списком ``skills.hub.enabled_sources``
+    из config.yaml. Hard-дефолт (ключ не задан) — только наш git-маркетплейс
+    ("marketplace"); публичные хабы скрыты из UI/CLI, но включаются обратно
+    добавлением их source_id в конфиг.
     """
     if auth is None:
         auth = GitHubAuth()
 
+    # [yep-fork] Читаем конфиг лениво (избегаем циклического импорта).
+    hub_cfg: Dict[str, Any] = {}
+    try:
+        from hermes_cli.config import load_config
+        hub_cfg = (load_config().get("skills") or {}).get("hub") or {}
+    except Exception as e:
+        logger.debug("could not load skills.hub config: %s", e)
+
+    marketplaces = hub_cfg.get("marketplaces")
+    if marketplaces is None:
+        marketplaces = list(_DEFAULT_MARKETPLACE_URLS)
+    enabled = hub_cfg.get("enabled_sources")
+    if enabled is None:
+        enabled = list(_DEFAULT_ENABLED_SOURCES)
+    enabled_set = {str(s) for s in enabled}
+
     taps_mgr = TapsManager()
     extra_taps = taps_mgr.list_taps()
 
-    sources: List[SkillSource] = [
+    all_sources: List[SkillSource] = [
         OptionalSkillSource(),        # Official optional skills (highest priority)
         HermesIndexSource(auth=auth), # Centralized index (search + resolved install paths)
         SkillsShSource(auth=auth),
@@ -4074,9 +4315,11 @@ def create_source_router(auth: Optional[GitHubAuth] = None) -> List[SkillSource]
         ClaudeMarketplaceSource(auth=auth),
         LobeHubSource(),
         BrowseShSource(),   # browse.sh: 169+ site-specific browser automation skills
+        GitMarketplaceSource(marketplaces),  # [yep-fork] наш git-маркетплейс
     ]
 
-    return sources
+    # [yep-fork] Оставляем только разрешённые конфигом источники.
+    return [s for s in all_sources if s.source_id() in enabled_set]
 
 
 def _search_one_source(
